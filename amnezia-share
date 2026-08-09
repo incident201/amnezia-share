@@ -1,0 +1,1726 @@
+#!/usr/bin/env python3
+"""
+Headless AmneziaVPN AWG2/AWG3 sharing and client management for an Amnezia VPS.
+
+Compatibility target: official amnezia-vpn/amnezia-client self-hosted format.
+- AWG2/AWG3 container: amnezia-awg2
+- server config: /opt/amnezia/awg/awg0.conf
+- clients table: /opt/amnezia/awg/clientsTable
+- client IDs: WireGuard/AWG public keys
+- Amnezia multi-QR framing: qint16 magic=1984, uint8 count, uint8 index,
+  QDataStream QByteArray (uint32 length + bytes), Base64URL, QR ECC L
+- payload compression: Qt qCompress-compatible (uint32 BE original size + zlib)
+
+Only Python stdlib is required. Runtime dependencies on the VPS:
+  docker, qrencode, ip, curl; Full Access also requires ssh-keygen
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import zlib
+import pwd
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
+
+
+VERSION = "0.2.2"
+
+CURRENT_CONTAINER = "amnezia-awg2"
+LEGACY_CONTAINER = "amnezia-awg"
+AWG_CONFIG = "/opt/amnezia/awg/awg0.conf"
+CLIENTS_TABLE = "/opt/amnezia/awg/clientsTable"
+SERVER_PUBLIC_KEY = "/opt/amnezia/awg/wireguard_server_public_key.key"
+SERVER_PSK = "/opt/amnezia/awg/wireguard_psk.key"
+AWG_INTERFACE = "awg0"
+
+QR_MAGIC = 1984
+OFFICIAL_QR_CHUNK = 850
+DEFAULT_DNS1 = "1.1.1.1"
+DEFAULT_DNS2 = "1.0.0.1"
+DEFAULT_MTU = "1376"  # official non-mobile default
+
+AWG_KEYS = [
+    "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
+    "H1", "H2", "H3", "H4",
+    "I1", "I2", "I3", "I4", "I5",
+    "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime",
+    "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
+    "MaxHandshakeAttempts",
+]
+AWG3_KEYS = [
+    "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime",
+    "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
+    "MaxHandshakeAttempts",
+]
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SECTION_RE = re.compile(r"(?m)^\s*\[(Interface|Peer)\]\s*$")
+ASSIGN_RE = re.compile(r"^\s*(?:#\s*)?([^=\s]+)\s*=\s*(.*?)\s*$")
+ASSIGN_ACTIVE_RE = re.compile(r"^\s*([^#=\s][^=\s]*)\s*=\s*(.*?)\s*$")
+
+
+class AmneziaShareError(RuntimeError):
+    pass
+
+
+@dataclass
+class Section:
+    kind: str
+    text: str
+    start: int
+    end: int
+
+
+@dataclass
+class ServerInfo:
+    container: str
+    config_text: str
+    interface: dict[str, str]
+    version: str
+    vpn_port: str
+    subnet_address: str
+    subnet_cidr: str
+    server_public_key: str
+    psk: str
+
+
+@dataclass
+class ClientMaterial:
+    name: str
+    client_private_key: str
+    client_public_key: str
+    client_ip: str
+    profile: dict[str, Any]
+
+
+# ----------------------------- process helpers -----------------------------
+
+def run(cmd: list[str], *, input_data: str | bytes | None = None,
+        check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
+    if isinstance(input_data, bytes):
+        text = False
+    p = subprocess.run(
+        cmd,
+        input=input_data,
+        capture_output=True,
+        text=text,
+    )
+    if check and p.returncode != 0:
+        stderr = p.stderr.decode(errors="replace") if isinstance(p.stderr, bytes) else p.stderr
+        stdout = p.stdout.decode(errors="replace") if isinstance(p.stdout, bytes) else p.stdout
+        detail = (stderr or stdout or "").strip()
+        raise AmneziaShareError(f"Command failed ({p.returncode}): {shlex.join(cmd)}\n{detail}")
+    return p
+
+
+def require_binary(name: str, install_hint: str | None = None) -> None:
+    if shutil.which(name):
+        return
+    msg = f"Required command not found: {name}"
+    if install_hint:
+        msg += f"\nInstall it with: {install_hint}"
+    raise AmneziaShareError(msg)
+
+
+def docker_exec(container: str, args: list[str], *, input_data: str | None = None,
+                check: bool = True) -> str:
+    cmd = ["docker", "exec"]
+    if input_data is not None:
+        cmd.append("-i")
+    cmd += [container] + args
+    p = run(cmd, input_data=input_data, check=check, text=True)
+    return p.stdout
+
+
+def docker_file_exists(container: str, path: str) -> bool:
+    p = run(["docker", "exec", container, "test", "-f", path], check=False)
+    return p.returncode == 0
+
+
+def docker_read(container: str, path: str, *, optional: bool = False) -> str:
+    p = run(["docker", "exec", container, "cat", path], check=False)
+    if p.returncode != 0:
+        if optional:
+            return ""
+        detail = (p.stderr or p.stdout or "").strip()
+        raise AmneziaShareError(f"Cannot read {path} in {container}: {detail}")
+    return p.stdout
+
+
+def docker_write_atomic(container: str, path: str, content: str) -> None:
+    tmp = path + ".amnezia-share.tmp"
+    script = (
+        "set -e; "
+        f"cat > {shlex.quote(tmp)}; "
+        f"chmod 600 {shlex.quote(tmp)}; "
+        f"mv -f {shlex.quote(tmp)} {shlex.quote(path)}"
+    )
+    docker_exec(container, ["sh", "-c", script], input_data=content)
+
+
+def docker_remove_file(container: str, path: str) -> None:
+    docker_exec(container, ["rm", "-f", path])
+
+
+def detect_container() -> str:
+    require_binary("docker", "apt install docker.io")
+    p = run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=True)
+    names = {x.strip() for x in p.stdout.splitlines() if x.strip()}
+    if CURRENT_CONTAINER in names:
+        running = run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", CURRENT_CONTAINER],
+            check=True,
+        ).stdout.strip().lower()
+        if running != "true":
+            raise AmneziaShareError(f"Container {CURRENT_CONTAINER} exists but is not running")
+        return CURRENT_CONTAINER
+    if LEGACY_CONTAINER in names:
+        raise AmneziaShareError(
+            "Detected legacy container amnezia-awg (AWG 1.x). "
+            "This build intentionally targets the official current amnezia-awg2 container "
+            "used by AWG2 and AWG3."
+        )
+    raise AmneziaShareError(
+        "Amnezia AWG container not found. Expected Docker container: amnezia-awg2"
+    )
+
+
+def sync_awg(container: str) -> None:
+    # Exact mechanism used by the official client for DockerContainer::Awg2.
+    command = f"awg syncconf {AWG_INTERFACE} <(awg-quick strip {shlex.quote(AWG_CONFIG)})"
+    docker_exec(container, ["bash", "-c", command])
+
+
+# ------------------------------- local state -------------------------------
+
+def state_dir() -> Path:
+    override = os.environ.get("AMNEZIA_SHARE_STATE_DIR")
+    if override:
+        p = Path(override)
+    elif hasattr(os, "geteuid") and os.geteuid() == 0:
+        p = Path("/var/lib/amnezia-share")
+    else:
+        p = Path.home() / ".local" / "share" / "amnezia-share"
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.chmod(0o700)
+    except OSError:
+        pass
+    return p
+
+
+def client_store_dir() -> Path:
+    p = state_dir() / "clients"
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.chmod(0o700)
+    except OSError:
+        pass
+    return p
+
+
+def backup_dir() -> Path:
+    p = state_dir() / "backups"
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.chmod(0o700)
+    except OSError:
+        pass
+    return p
+
+
+def full_access_store_dir() -> Path:
+    p = state_dir() / "full-access"
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.chmod(0o700)
+    except OSError:
+        pass
+    return p
+
+
+def full_access_record_path(access_id: str) -> Path:
+    return full_access_store_dir() / f"{access_id}.json"
+
+
+def save_full_access_record(access_id: str, *, ssh_user: str, host: str, ssh_port: int,
+                            public_key_line: str, authorized_keys_path: Path) -> Path:
+    p = full_access_record_path(access_id)
+    payload = {
+        "id": access_id,
+        "createdAt": datetime.now().astimezone().isoformat(),
+        "sshUser": ssh_user,
+        "host": host,
+        "sshPort": ssh_port,
+        "authorizedKeys": str(authorized_keys_path),
+        "publicKey": public_key_line.strip(),
+    }
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+    return p
+
+
+def load_full_access_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for p in full_access_store_dir().glob("*.json"):
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(obj, dict) and isinstance(obj.get("id"), str):
+                records.append(obj)
+        except Exception:
+            continue
+    records.sort(key=lambda x: str(x.get("createdAt", "")))
+    return records
+
+
+def save_backup(config_text: str, table_text: str) -> Path:
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    p = backup_dir() / stamp
+    p.mkdir(mode=0o700)
+    (p / "awg0.conf").write_text(config_text, encoding="utf-8")
+    (p / "clientsTable").write_text(table_text, encoding="utf-8")
+    for f in p.iterdir():
+        try:
+            f.chmod(0o600)
+        except OSError:
+            pass
+
+    # Keep only the newest 10 helper backups.
+    all_backups = sorted([x for x in backup_dir().iterdir() if x.is_dir()], reverse=True)
+    for old in all_backups[10:]:
+        shutil.rmtree(old, ignore_errors=True)
+    return p
+
+
+def profile_store_path(client_id: str) -> Path:
+    digest = hashlib.sha256(client_id.encode()).hexdigest()[:16]
+    return client_store_dir() / f"{digest}.json"
+
+
+def save_client_profile(material: ClientMaterial) -> Path:
+    p = profile_store_path(material.client_public_key)
+    payload = {
+        "clientId": material.client_public_key,
+        "clientName": material.name,
+        "createdAt": datetime.now().astimezone().isoformat(),
+        "profile": material.profile,
+    }
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+    return p
+
+
+def load_saved_profiles() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    d = client_store_dir()
+    for p in d.glob("*.json"):
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            cid = obj.get("clientId")
+            if isinstance(cid, str) and cid:
+                result[cid] = obj
+        except Exception:
+            continue
+    return result
+
+
+def remove_saved_profile(client_id: str) -> None:
+    p = profile_store_path(client_id)
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ----------------------------- AWG config parser ----------------------------
+
+def sections(text: str) -> list[Section]:
+    matches = list(SECTION_RE.finditer(text))
+    out: list[Section] = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        out.append(Section(m.group(1), text[m.start():end], m.start(), end))
+    return out
+
+
+def parse_assignments(block: str, *, include_commented: bool = False) -> dict[str, str]:
+    result: dict[str, str] = {}
+    rx = ASSIGN_RE if include_commented else ASSIGN_ACTIVE_RE
+    for line in block.splitlines()[1:]:
+        if not include_commented and line.lstrip().startswith("#"):
+            continue
+        m = rx.match(line)
+        if m:
+            result[m.group(1).strip()] = m.group(2).strip()
+    return result
+
+
+def interface_values(config_text: str) -> dict[str, str]:
+    for s in sections(config_text):
+        if s.kind == "Interface":
+            return parse_assignments(s.text, include_commented=True)
+    raise AmneziaShareError("[Interface] section not found in awg0.conf")
+
+
+def peer_records(config_text: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for s in sections(config_text):
+        if s.kind == "Peer":
+            values = parse_assignments(s.text)
+            if values.get("PublicKey"):
+                out.append(values)
+    return out
+
+
+def detect_awg_version(values: dict[str, str]) -> str:
+    # Mirrors AwgProtocolConfig::awgVersionOf().
+    if any(values.get(k, "").strip() for k in AWG3_KEYS):
+        return "3"
+
+    has_junk_sizes = any(values.get(k, "").strip() for k in ("S3", "S4"))
+    has_header_ranges = any("-" in values.get(k, "") for k in ("H1", "H2", "H3", "H4"))
+    if has_junk_sizes or has_header_ranges:
+        return "2"
+
+    if any(values.get(k, "").strip() for k in ("I1", "I2", "I3", "I4", "I5")):
+        return "1.5"
+    return ""
+
+
+def parse_server_info(container: str) -> ServerInfo:
+    config_text = docker_read(container, AWG_CONFIG)
+    values = interface_values(config_text)
+    address = values.get("Address", "10.8.1.0/24")
+    if "/" in address:
+        subnet_address, subnet_cidr = address.split("/", 1)
+    else:
+        subnet_address, subnet_cidr = address, "24"
+    vpn_port = values.get("ListenPort", "55424")
+    version = detect_awg_version(values)
+    server_pub = docker_read(container, SERVER_PUBLIC_KEY).strip()
+    psk = docker_read(container, SERVER_PSK).strip()
+    if not server_pub or not psk:
+        raise AmneziaShareError("Server public key or PSK is empty")
+    return ServerInfo(
+        container=container,
+        config_text=config_text,
+        interface=values,
+        version=version,
+        vpn_port=vpn_port,
+        subnet_address=subnet_address,
+        subnet_cidr=subnet_cidr,
+        server_public_key=server_pub,
+        psk=psk,
+    )
+
+
+def official_next_client_ip(info: ServerInfo) -> str:
+    ips: list[ipaddress.IPv4Address] = []
+    for peer in peer_records(info.config_text):
+        allowed = peer.get("AllowedIPs", "")
+        m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", allowed)
+        if not m:
+            continue
+        try:
+            ips.append(ipaddress.IPv4Address(m.group(1)))
+        except ipaddress.AddressValueError:
+            continue
+
+    try:
+        last = ips[-1] if ips else ipaddress.IPv4Address(info.subnet_address)
+    except ipaddress.AddressValueError as e:
+        raise AmneziaShareError(f"Invalid AWG subnet address: {info.subnet_address}") from e
+
+    # Reproduce the official client's increment behavior.
+    last_octet = int(str(last).rsplit(".", 1)[1])
+    increment = 3 if last_octet == 254 else 2 if last_octet == 255 else 1
+    nxt = ipaddress.IPv4Address(int(last) + increment)
+
+    try:
+        network = ipaddress.IPv4Network(f"{info.subnet_address}/{info.subnet_cidr}", strict=False)
+        if nxt not in network:
+            raise AmneziaShareError(
+                f"No safe next client address in {network}; official next-IP algorithm produced {nxt}"
+            )
+    except ValueError as e:
+        raise AmneziaShareError("Invalid AWG subnet in awg0.conf") from e
+
+    return str(nxt)
+
+
+def generate_client_keys(container: str) -> tuple[str, str]:
+    private = docker_exec(container, ["awg", "genkey"]).strip()
+    if not private:
+        raise AmneziaShareError("awg genkey returned an empty private key")
+    public = docker_exec(container, ["awg", "pubkey"], input_data=private + "\n").strip()
+    if not public:
+        raise AmneziaShareError("awg pubkey returned an empty public key")
+    return private, public
+
+
+def append_peer(config_text: str, public_key: str, psk: str, client_ip: str) -> str:
+    peer = (
+        "[Peer]\n"
+        f"PublicKey = {public_key}\n"
+        f"PresharedKey = {psk}\n"
+        f"AllowedIPs = {client_ip}/32\n\n"
+    )
+    return config_text.rstrip() + "\n\n" + peer
+
+
+def remove_peer(config_text: str, client_id: str) -> tuple[str, bool]:
+    ss = sections(config_text)
+    remove_ranges: list[tuple[int, int]] = []
+    for s in ss:
+        if s.kind != "Peer":
+            continue
+        values = parse_assignments(s.text)
+        if values.get("PublicKey") == client_id:
+            remove_ranges.append((s.start, s.end))
+    if not remove_ranges:
+        return config_text, False
+    result = config_text
+    for start, end in reversed(remove_ranges):
+        result = result[:start] + result[end:]
+    result = result.rstrip() + "\n"
+    return result, True
+
+
+# ------------------------------- clientsTable -------------------------------
+
+def qt_text_date_now() -> str:
+    # Close to QDateTime::currentDateTime().toString(Qt::TextDate); metadata only.
+    now = datetime.now().astimezone()
+    return now.strftime("%a %b %d %H:%M:%S %Y")
+
+
+def load_clients_table(raw: str) -> list[dict[str, Any]]:
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise AmneziaShareError(f"clientsTable is not valid JSON: {e}") from e
+
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+
+    # Official migration path for the old object format.
+    if isinstance(data, dict):
+        migrated: list[dict[str, Any]] = []
+        for client_id, old_value in data.items():
+            if not isinstance(client_id, str):
+                continue
+            name = ""
+            if isinstance(old_value, dict):
+                v = old_value.get("clientName")
+                if isinstance(v, str):
+                    name = v
+            migrated.append({
+                "clientId": client_id,
+                "userData": {"clientName": name},
+            })
+        return migrated
+
+    raise AmneziaShareError("Unsupported clientsTable JSON format")
+
+
+def dump_clients_table(table: list[dict[str, Any]]) -> str:
+    return json.dumps(table, ensure_ascii=False, indent=4) + "\n"
+
+
+def append_table_client(table: list[dict[str, Any]], client_id: str, name: str) -> None:
+    for item in table:
+        if item.get("clientId") == client_id:
+            ud = item.setdefault("userData", {})
+            if isinstance(ud, dict):
+                ud["clientName"] = name
+                ud["creationDate"] = qt_text_date_now()
+            return
+    table.append({
+        "clientId": client_id,
+        "userData": {
+            "clientName": name,
+            "creationDate": qt_text_date_now(),
+        },
+    })
+
+
+def remove_table_client(table: list[dict[str, Any]], client_id: str) -> bool:
+    old_len = len(table)
+    table[:] = [x for x in table if x.get("clientId") != client_id]
+    return len(table) != old_len
+
+
+# -------------------------- official profile format -------------------------
+
+def awg_server_json(info: ServerInfo) -> dict[str, Any]:
+    obj: dict[str, Any] = {}
+    if info.vpn_port:
+        obj["port"] = info.vpn_port
+    obj["transport_proto"] = "udp"
+    if info.version:
+        obj["protocol_version"] = info.version
+    if info.subnet_address:
+        obj["subnet_address"] = info.subnet_address
+    if info.subnet_cidr:
+        obj["subnet_cidr"] = info.subnet_cidr
+
+    # AwgServerConfig::toJson writes non-empty standard parameters.
+    for key in [
+        "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
+        "H1", "H2", "H3", "H4",
+    ]:
+        val = info.interface.get(key, "")
+        if val:
+            obj[key] = val
+
+    # Official AwgServerConfig::toJson writes I1..I5 even when empty.
+    for key in ("I1", "I2", "I3", "I4", "I5"):
+        obj[key] = info.interface.get(key, "")
+
+    for key in AWG3_KEYS:
+        val = info.interface.get(key, "")
+        if val:
+            obj[key] = val
+    return obj
+
+
+def endpoint_host(host: str) -> str:
+    host = host.strip()
+    # Keep official behavior for hostnames/IPv4; make literal IPv6 syntactically valid.
+    if ":" in host and not host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host)
+            return f"[{host}]"
+        except ipaddress.AddressValueError:
+            pass
+    return host
+
+
+def build_native_awg_config(info: ServerInfo, *, host: str, client_ip: str,
+                            private_key: str, persistent_keepalive: str) -> str:
+    v = info.interface
+    values: list[tuple[str, str]] = [
+        ("Address", f"{client_ip}/32"),
+        ("DNS", "$PRIMARY_DNS, $SECONDARY_DNS"),
+        ("PrivateKey", private_key),
+        ("Jc", v.get("Jc", "")),
+        ("Jmin", v.get("Jmin", "")),
+        ("Jmax", v.get("Jmax", "")),
+        ("S1", v.get("S1", "")),
+        ("S2", v.get("S2", "")),
+        ("S3", v.get("S3", "")),
+        ("S4", v.get("S4", "")),
+        ("H1", v.get("H1", "")),
+        ("H2", v.get("H2", "")),
+        ("H3", v.get("H3", "")),
+        ("H4", v.get("H4", "")),
+        ("I1", v.get("I1", "")),
+        ("I2", v.get("I2", "")),
+        ("I3", v.get("I3", "")),
+        ("I4", v.get("I4", "")),
+        ("I5", v.get("I5", "")),
+        ("HeaderProtectionKey", v.get("HeaderProtectionKey", "")),
+        ("ContentPaddingAddition", v.get("ContentPaddingAddition", "")),
+        ("RekeyAfterTime", v.get("RekeyAfterTime", "")),
+        ("RekeyTimeout", v.get("RekeyTimeout", "")),
+        ("RejectAfterTime", v.get("RejectAfterTime", "")),
+        ("KeepaliveTimeout", v.get("KeepaliveTimeout", "")),
+        ("MaxHandshakeAttempts", v.get("MaxHandshakeAttempts", "")),
+    ]
+
+    lines = ["[Interface]"]
+    for key, value in values:
+        if value != "":
+            lines.append(f"{key} = {value}")
+
+    lines += [
+        "",
+        "[Peer]",
+        f"PublicKey = {info.server_public_key}",
+        f"PresharedKey = {info.psk}",
+        "AllowedIPs = 0.0.0.0/0, ::/0",
+        f"Endpoint = {endpoint_host(host)}:{info.vpn_port}",
+        f"PersistentKeepalive = {persistent_keepalive}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_client_profile(info: ServerInfo, *, name: str, host: str,
+                         client_ip: str, private_key: str, public_key: str,
+                         dns1: str, dns2: str, mtu: str) -> dict[str, Any]:
+    persistent = "25-35" if info.version == "3" else "25"
+    native = build_native_awg_config(
+        info,
+        host=host,
+        client_ip=client_ip,
+        private_key=private_key,
+        persistent_keepalive=persistent,
+    )
+
+    inner: dict[str, Any] = {
+        "config": native,
+        "hostName": host,
+        "port": int(info.vpn_port),
+        "client_ip": client_ip,
+        "client_priv_key": private_key,
+        "client_pub_key": public_key,
+        "server_pub_key": info.server_public_key,
+        "psk_key": info.psk,
+        "clientId": public_key,
+        "allowed_ips": ["0.0.0.0/0", "::/0"],
+        "persistent_keep_alive": persistent,
+        "mtu": mtu,
+    }
+
+    # AwgConfigurator copies non-empty AWG fields from the generated native config.
+    for key in AWG_KEYS:
+        value = info.interface.get(key, "")
+        if value:
+            inner[key] = value
+
+    awg = awg_server_json(info)
+    awg["last_config"] = json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
+
+    return {
+        "description": name,
+        "hostName": host,
+        "containers": [
+            {
+                "container": CURRENT_CONTAINER,
+                "awg": awg,
+            }
+        ],
+        "defaultContainer": CURRENT_CONTAINER,
+        "dns1": dns1,
+        "dns2": dns2,
+        # Intentionally no top-level userName/password/port: official client-access export.
+    }
+
+
+def build_full_profile(info: ServerInfo, *, description: str, host: str,
+                       ssh_user: str, ssh_secret: str, ssh_port: int,
+                       dns1: str | None = None, dns2: str | None = None) -> dict[str, Any]:
+    profile: dict[str, Any] = {
+        "description": description,
+        "hostName": host,
+        "containers": [
+            {
+                "container": CURRENT_CONTAINER,
+                "awg": awg_server_json(info),
+            }
+        ],
+        "defaultContainer": CURRENT_CONTAINER,
+        "userName": ssh_user,
+        "password": ssh_secret,
+        "port": ssh_port,
+    }
+    if dns1:
+        profile["dns1"] = dns1
+    if dns2:
+        profile["dns2"] = dns2
+    return profile
+
+
+def qt_json_bytes(obj: dict[str, Any]) -> bytes:
+    # QJsonDocument::toJson() defaults to indented JSON and includes a trailing newline.
+    return (json.dumps(obj, ensure_ascii=False, indent=4) + "\n").encode("utf-8")
+
+
+def qt_compress(data: bytes, level: int = 8) -> bytes:
+    # qCompress(): 4-byte BE uncompressed size, then zlib stream.
+    return struct.pack(">I", len(data)) + zlib.compress(data, level)
+
+
+def vpn_url(profile: dict[str, Any]) -> str:
+    compressed = qt_compress(qt_json_bytes(profile), 8)
+    encoded = base64.urlsafe_b64encode(compressed).rstrip(b"=").decode("ascii")
+    return "vpn://" + encoded
+
+
+# ------------------------------- multi-QR ----------------------------------
+
+def qdatastream_chunk(payload: bytes, chunks_count: int, chunk_id: int) -> bytes:
+    if not (0 <= chunks_count <= 255 and 0 <= chunk_id <= 255):
+        raise AmneziaShareError("Amnezia QR format uses uint8 chunk counters (max 255)")
+    # QDataStream default endian = BigEndian.
+    # QByteArray serialization for this payload size = quint32 length + raw data.
+    return struct.pack(">hBBI", QR_MAGIC, chunks_count, chunk_id, len(payload)) + payload
+
+
+def qr_payloads(data: bytes, chunk_size: int) -> list[str]:
+    if chunk_size <= 0:
+        raise AmneziaShareError("QR chunk size must be positive")
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)] or [b""]
+    if len(chunks) > 255:
+        raise AmneziaShareError(
+            f"Profile needs {len(chunks)} QR chunks at chunk size {chunk_size}; maximum is 255"
+        )
+    result = []
+    for i, chunk in enumerate(chunks):
+        framed = qdatastream_chunk(chunk, len(chunks), i)
+        result.append(base64.urlsafe_b64encode(framed).rstrip(b"=").decode("ascii"))
+    return result
+
+
+def render_qr(payload: str, qr_type: str = "ANSIUTF8", margin: int = 1) -> str:
+    require_binary("qrencode", "apt update && apt install -y qrencode")
+    cmd = ["qrencode", "-t", qr_type, "-l", "L", "-m", str(margin), payload]
+    p = run(cmd, check=False)
+    if p.returncode != 0 and qr_type != "UTF8":
+        # Very old builds may have fewer terminal output types.
+        return render_qr(payload, "UTF8", margin)
+    if p.returncode != 0:
+        raise AmneziaShareError((p.stderr or "qrencode failed").strip())
+    return p.stdout
+
+
+def visible_size(rendered: str) -> tuple[int, int]:
+    clean = ANSI_RE.sub("", rendered)
+    lines = clean.splitlines()
+    if not lines:
+        return 0, 0
+    return max(len(line) for line in lines), len(lines)
+
+
+def choose_chunk_size(data: bytes, requested: str, qr_type: str, margin: int,
+                      header_lines: int = 3) -> tuple[int, tuple[int, int]]:
+    if requested != "auto":
+        try:
+            size = int(requested)
+        except ValueError as e:
+            raise AmneziaShareError("--chunk-size must be 'auto' or an integer") from e
+        payloads = qr_payloads(data, size)
+        rendered = render_qr(payloads[0], qr_type, margin)
+        return size, visible_size(rendered)
+
+    cols, rows = shutil.get_terminal_size((120, 60))
+    candidates = [850, 760, 680, 600, 520, 440, 360, 300, 256, 224, 192, 160, 128, 112, 96, 80, 64]
+    last_valid: tuple[int, tuple[int, int]] | None = None
+    for size in candidates:
+        try:
+            payloads = qr_payloads(data, size)
+        except AmneziaShareError:
+            continue
+        rendered = render_qr(payloads[0], qr_type, margin)
+        wh = visible_size(rendered)
+        last_valid = (size, wh)
+        if wh[0] <= cols and wh[1] + header_lines <= rows:
+            return size, wh
+    if last_valid:
+        return last_valid
+    raise AmneziaShareError("Could not choose a valid QR chunk size")
+
+
+def show_dynamic_qr(profile: dict[str, Any], *, title: str,
+                    interval: float = 1.0, chunk_size: str = "auto",
+                    qr_type: str = "ANSIUTF8", margin: int = 1,
+                    keep_screen: bool = False) -> None:
+    if not sys.stdout.isatty():
+        raise AmneziaShareError("Dynamic QR output requires a TTY/PTY (for SSH use: ssh -t ...)")
+    data = qt_compress(qt_json_bytes(profile), 8)
+    size, measured = choose_chunk_size(data, chunk_size, qr_type, margin)
+    payloads = qr_payloads(data, size)
+    cols, rows = shutil.get_terminal_size((120, 60))
+
+    if measured[0] > cols or measured[1] + 3 > rows:
+        print(
+            f"Warning: terminal is smaller than the QR output "
+            f"(terminal {cols}x{rows}, QR about {measured[0]}x{measured[1]}).\n"
+            "Enlarge the terminal or reduce --chunk-size if scanning is unreliable.\n",
+            file=sys.stderr,
+        )
+        time.sleep(1.5)
+
+    try:
+        sys.stdout.write("\033[?25l")  # hide cursor
+        sys.stdout.flush()
+        index = 0
+        while True:
+            rendered = render_qr(payloads[index], qr_type, margin)
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(
+                f"{title}\n"
+                f"Frame {index + 1}/{len(payloads)} | chunk={size} | "
+                f"interval={interval:g}s | Ctrl+C to stop\n\n"
+            )
+            sys.stdout.write(rendered)
+            sys.stdout.flush()
+            time.sleep(interval)
+            index = (index + 1) % len(payloads)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if not keep_screen:
+            sys.stdout.write("\033[2J\033[H")
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
+
+# ----------------------------- profile management --------------------------
+
+def _public_ip(value: str) -> str | None:
+    value = value.strip()
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return str(ip) if ip.is_global else None
+
+
+def _public_ip_from_default_route() -> str | None:
+    # Read the host's main routing table explicitly, avoiding policy-routing
+    # tables such as WARP.
+    if not shutil.which("ip"):
+        return None
+    p = run(["ip", "-4", "route", "show", "table", "main", "default"], check=False)
+    if p.returncode != 0:
+        return None
+
+    for line in p.stdout.splitlines():
+        fields = line.split()
+
+        # Many VPS providers put the selected source address directly on the
+        # default route: "default via ... dev eth0 src 203.0.113.10".
+        if "src" in fields:
+            i = fields.index("src")
+            if i + 1 < len(fields):
+                candidate = _public_ip(fields[i + 1])
+                if candidate:
+                    return candidate
+
+        # If the route has no explicit src, inspect global addresses assigned
+        # to the default-route interface. Ignore RFC1918/CGNAT/etc.; those are
+        # not usable as an Internet endpoint and will fall through to curl.
+        if "dev" in fields:
+            i = fields.index("dev")
+            if i + 1 >= len(fields):
+                continue
+            dev = fields[i + 1]
+            a = run(["ip", "-4", "addr", "show", "dev", dev, "scope", "global"], check=False)
+            if a.returncode != 0:
+                continue
+            for match in re.finditer(r"\binet\s+([0-9.]+)/\d+", a.stdout):
+                candidate = _public_ip(match.group(1))
+                if candidate:
+                    return candidate
+    return None
+
+
+def _public_ip_from_ifconfig_me() -> str | None:
+    curl = shutil.which("curl")
+    if not curl:
+        return None
+    p = run(
+        [curl, "-4", "-fsS", "--max-time", "5", "https://ifconfig.me/ip"],
+        check=False,
+    )
+    if p.returncode != 0:
+        return None
+    return _public_ip(p.stdout)
+
+
+def detect_host(explicit: str | None = None) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip()
+
+    host = _public_ip_from_default_route()
+    if host:
+        return host
+
+    host = _public_ip_from_ifconfig_me()
+    if host:
+        return host
+
+    if sys.stdin.isatty():
+        value = input("Public server IP/hostname: ").strip()
+        if value:
+            return value
+    raise AmneziaShareError("Cannot detect public server address; pass --host")
+
+
+def detect_ssh_port(explicit: int | None = None) -> int:
+    if explicit:
+        return explicit
+    env = os.environ.get("AMNEZIA_SSH_PORT")
+    if env and env.isdigit():
+        return int(env)
+    return 22
+
+
+def detect_ssh_user(explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("AMNEZIA_SSH_USER")
+    if env:
+        return env
+    # When this helper is run as root on the VPS, root is the safest default:
+    # Amnezia's management scripts execute sudo commands after connecting.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return "root"
+    return getpass.getuser()
+
+
+def ssh_user_entry(user: str):
+    try:
+        return pwd.getpwnam(user)
+    except KeyError as e:
+        raise AmneziaShareError(f"Local SSH user does not exist: {user}") from e
+
+
+def authorized_keys_for_user(user: str) -> tuple[Path, int, int]:
+    pw = ssh_user_entry(user)
+    return Path(pw.pw_dir) / ".ssh" / "authorized_keys", pw.pw_uid, pw.pw_gid
+
+
+def ensure_authorized_key(user: str, public_key_line: str) -> Path:
+    path, uid, gid = authorized_keys_for_user(user)
+    if hasattr(os, "geteuid") and os.geteuid() != 0 and uid != os.geteuid():
+        raise AmneziaShareError(
+            f"Need root privileges to add a generated SSH key for user {user}. "
+            "Run amnezia-share via sudo/root or choose your current user."
+        )
+
+    ssh_dir = path.parent
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ssh_dir.chmod(0o700)
+        os.chown(ssh_dir, uid, gid)
+    except PermissionError:
+        pass
+
+    existing = ""
+    if path.exists():
+        existing = path.read_text(encoding="utf-8", errors="replace")
+    if public_key_line.strip() not in {line.strip() for line in existing.splitlines()}:
+        with path.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write(public_key_line.rstrip() + "\n")
+    try:
+        path.chmod(0o600)
+        os.chown(path, uid, gid)
+    except PermissionError:
+        pass
+    return path
+
+
+def remove_authorized_marker(path: Path, marker: str) -> bool:
+    if not path.exists():
+        return False
+    old = path.read_text(encoding="utf-8", errors="replace")
+    old_lines = old.splitlines()
+    new_lines = [line for line in old_lines if marker not in line]
+    if len(new_lines) == len(old_lines):
+        return False
+    content = "\n".join(new_lines)
+    if content:
+        content += "\n"
+    tmp = path.with_name(path.name + ".amnezia-share.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    try:
+        st = path.stat()
+        os.chmod(tmp, st.st_mode & 0o777)
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except (PermissionError, FileNotFoundError):
+        pass
+    os.replace(tmp, path)
+    return True
+
+
+def generate_full_access_ssh_key(*, ssh_user: str, host: str, ssh_port: int) -> tuple[str, str, Path]:
+    require_binary("ssh-keygen", "apt update && apt install -y openssh-client")
+    access_id = uuid.uuid4().hex[:12]
+    marker = f"amnezia-share-full:{access_id}"
+
+    with tempfile.TemporaryDirectory(prefix="amnezia-share-key-") as td:
+        key_path = Path(td) / "id_ed25519"
+        run([
+            "ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+            "-C", marker, "-f", str(key_path),
+        ])
+        private_key = key_path.read_text(encoding="utf-8")
+        public_key_line = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
+
+    if "BEGIN" not in private_key or "PRIVATE KEY" not in private_key:
+        raise AmneziaShareError("ssh-keygen produced an unexpected private-key format")
+
+    auth_path = ensure_authorized_key(ssh_user, public_key_line)
+    save_full_access_record(
+        access_id,
+        ssh_user=ssh_user,
+        host=host,
+        ssh_port=ssh_port,
+        public_key_line=public_key_line,
+        authorized_keys_path=auth_path,
+    )
+    return access_id, private_key, auth_path
+
+
+def select_full_access_record(selector: str) -> dict[str, Any]:
+    records = load_full_access_records()
+    matches = [r for r in records if str(r.get("id", "")).startswith(selector)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise AmneziaShareError("Full-access ID prefix is ambiguous")
+    raise AmneziaShareError(f"Full-access key not found: {selector}")
+
+
+def print_full_access_records() -> list[dict[str, Any]]:
+    records = load_full_access_records()
+    if not records:
+        print("No generated Full Access SSH keys.")
+        return records
+    print(f"{'ID':<14} {'User':<12} {'Host':<28} {'SSH':<6} Created")
+    print("-" * 90)
+    for r in records:
+        print(
+            f"{str(r.get('id','')):<14} {str(r.get('sshUser','')):<12} "
+            f"{str(r.get('host',''))[:28]:<28} {str(r.get('sshPort','')):<6} "
+            f"{str(r.get('createdAt',''))}"
+        )
+    return records
+
+
+def revoke_full_access(selector: str) -> None:
+    record = select_full_access_record(selector)
+    access_id = str(record["id"])
+    marker = f"amnezia-share-full:{access_id}"
+    path = Path(str(record.get("authorizedKeys", "")))
+    removed = remove_authorized_marker(path, marker)
+    try:
+        full_access_record_path(access_id).unlink()
+    except FileNotFoundError:
+        pass
+    if removed:
+        print(f"Revoked Full Access: {access_id}")
+    else:
+        print(f"Full Access metadata removed; authorized_keys entry was already absent: {access_id}")
+
+
+
+
+def transaction_write(container: str, old_config: str, new_config: str,
+                      old_table_raw: str, new_table_raw: str) -> Path:
+    backup = save_backup(old_config, old_table_raw)
+    table_existed = docker_file_exists(container, CLIENTS_TABLE)
+    try:
+        docker_write_atomic(container, AWG_CONFIG, new_config)
+        docker_write_atomic(container, CLIENTS_TABLE, new_table_raw)
+        sync_awg(container)
+    except Exception as original:
+        rollback_errors: list[str] = []
+        try:
+            docker_write_atomic(container, AWG_CONFIG, old_config)
+        except Exception as e:
+            rollback_errors.append(f"config rollback: {e}")
+        try:
+            if table_existed:
+                docker_write_atomic(container, CLIENTS_TABLE, old_table_raw)
+            else:
+                docker_remove_file(container, CLIENTS_TABLE)
+        except Exception as e:
+            rollback_errors.append(f"clientsTable rollback: {e}")
+        try:
+            sync_awg(container)
+        except Exception as e:
+            rollback_errors.append(f"sync rollback: {e}")
+        extra = ""
+        if rollback_errors:
+            extra = "\nRollback also reported:\n- " + "\n- ".join(rollback_errors)
+        raise AmneziaShareError(f"Update failed and rollback was attempted: {original}{extra}") from original
+    return backup
+
+
+def native_client_config(profile: dict[str, Any]) -> str:
+    """Return the official-style native AWG config with export DNS applied."""
+    try:
+        containers = profile["containers"]
+        awg = containers[0]["awg"]
+        last_config = awg["last_config"]
+        inner = json.loads(last_config) if isinstance(last_config, str) else last_config
+        config = inner["config"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        raise AmneziaShareError("Saved/generated profile does not contain a native AWG config") from e
+
+    if not isinstance(config, str) or not config.strip():
+        raise AmneziaShareError("Native AWG config is empty")
+
+    dns1 = str(profile.get("dns1") or DEFAULT_DNS1)
+    dns2 = str(profile.get("dns2") or DEFAULT_DNS2)
+    # Official ConfiguratorBase::processConfigWithExportSettings() performs
+    # these substitutions before native .conf export.
+    config = config.replace("$PRIMARY_DNS", dns1).replace("$SECONDARY_DNS", dns2)
+    config = config.replace("\r", "")
+    return config.rstrip("\n") + "\n"
+
+
+def _safe_conf_basename(name: str) -> str:
+    safe = re.sub(r"[^\w.-]+", "_", name.strip(), flags=re.UNICODE).strip("._")
+    return safe or "amnezia-client"
+
+
+def resolve_conf_output(name: str, requested: str) -> Path:
+    default_name = _safe_conf_basename(name) + ".conf"
+    if requested == "":
+        path = Path.cwd() / default_name
+    else:
+        path = Path(requested).expanduser()
+        if path.exists() and path.is_dir():
+            path = path / default_name
+        elif path.suffix.lower() != ".conf":
+            path = path.with_name(path.name + ".conf")
+
+    parent = path.parent
+    if not parent.exists() or not parent.is_dir():
+        raise AmneziaShareError(f"Config output directory does not exist: {parent}")
+    if path.exists():
+        raise AmneziaShareError(f"Refusing to overwrite existing config: {path}")
+
+    # Verify the directory is actually writable before creating a server peer.
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".amnezia-share-write-test-", dir=parent, delete=True):
+            pass
+    except OSError as e:
+        raise AmneziaShareError(f"Cannot write config to {parent}: {e}") from e
+    return path.absolute()
+
+
+def write_client_conf(profile: dict[str, Any], path: Path) -> None:
+    data = native_client_config(profile)
+    tmp = path.with_name(path.name + ".amnezia-share.tmp")
+    try:
+        with tmp.open("x", encoding="utf-8") as f:
+            f.write(data)
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+        path.chmod(0o600)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def create_client(name: str, *, host: str, dns1: str, dns2: str, mtu: str) -> ClientMaterial:
+    container = detect_container()
+    info = parse_server_info(container)
+    if info.version not in ("2", "3"):
+        raise AmneziaShareError(
+            f"Detected AWG protocol version '{info.version or 'unknown'}'. This build supports AWG2/AWG3."
+        )
+
+    old_table_raw = docker_read(container, CLIENTS_TABLE, optional=True)
+    table = load_clients_table(old_table_raw)
+
+    client_ip = official_next_client_ip(info)
+    private_key, public_key = generate_client_keys(container)
+
+    profile = build_client_profile(
+        info,
+        name=name,
+        host=host,
+        client_ip=client_ip,
+        private_key=private_key,
+        public_key=public_key,
+        dns1=dns1,
+        dns2=dns2,
+        mtu=mtu,
+    )
+    new_config = append_peer(info.config_text, public_key, info.psk, client_ip)
+    append_table_client(table, public_key, name)
+    new_table_raw = dump_clients_table(table)
+
+    backup = transaction_write(
+        container,
+        info.config_text,
+        new_config,
+        old_table_raw,
+        new_table_raw,
+    )
+
+    material = ClientMaterial(name, private_key, public_key, client_ip, profile)
+    saved = save_client_profile(material)
+    print(f"Created {name}: {client_ip}/32")
+    print(f"Client ID: {public_key}")
+    print(f"Backup: {backup}")
+    print(f"Re-share data (0600): {saved}")
+    return material
+
+
+def current_records() -> tuple[ServerInfo, list[dict[str, Any]], dict[str, dict[str, str]]]:
+    container = detect_container()
+    info = parse_server_info(container)
+    table = load_clients_table(docker_read(container, CLIENTS_TABLE, optional=True))
+    peers = {p.get("PublicKey", ""): p for p in peer_records(info.config_text) if p.get("PublicKey")}
+    return info, table, peers
+
+
+def display_records() -> list[dict[str, Any]]:
+    _, table, peers = current_records()
+    saved = load_saved_profiles()
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in table:
+        cid = item.get("clientId")
+        if not isinstance(cid, str) or not cid:
+            continue
+        ud = item.get("userData") if isinstance(item.get("userData"), dict) else {}
+        name = ud.get("clientName") if isinstance(ud.get("clientName"), str) else ""
+        peer = peers.get(cid, {})
+        records.append({
+            "clientId": cid,
+            "name": name or "(unnamed)",
+            "allowed": peer.get("AllowedIPs", "—"),
+            "saved": cid in saved,
+        })
+        seen.add(cid)
+
+    # Peers missing from clientsTable are still manageable by public key.
+    for cid, peer in peers.items():
+        if cid in seen:
+            continue
+        records.append({
+            "clientId": cid,
+            "name": "(not in clientsTable)",
+            "allowed": peer.get("AllowedIPs", "—"),
+            "saved": cid in saved,
+        })
+
+    return records
+
+
+def print_clients() -> list[dict[str, Any]]:
+    info, _, _ = current_records()
+    records = display_records()
+    print(f"Container: {CURRENT_CONTAINER} | AWG version: {info.version or 'unknown'} | UDP {info.vpn_port}")
+    if not records:
+        print("No clients.")
+        return records
+    print()
+    print(f"{'#':>3}  {'Name':<24} {'Address':<20} {'Saved':<5} Client ID")
+    print("-" * 100)
+    for i, r in enumerate(records, 1):
+        print(
+            f"{i:>3}  {r['name'][:24]:<24} {r['allowed'][:20]:<20} "
+            f"{('yes' if r['saved'] else 'no'):<5} {r['clientId']}"
+        )
+    return records
+
+
+def select_record(selector: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    selector = selector.strip()
+    if selector.isdigit():
+        i = int(selector)
+        if 1 <= i <= len(records):
+            return records[i - 1]
+
+    exact_name = [r for r in records if r["name"].casefold() == selector.casefold()]
+    if len(exact_name) == 1:
+        return exact_name[0]
+    if len(exact_name) > 1:
+        raise AmneziaShareError("Client name is not unique; use the list number or public-key prefix")
+
+    by_key = [r for r in records if r["clientId"].startswith(selector)]
+    if len(by_key) == 1:
+        return by_key[0]
+    if len(by_key) > 1:
+        raise AmneziaShareError("Public-key prefix is ambiguous")
+    raise AmneziaShareError(f"Client not found: {selector}")
+
+
+def remove_client(selector: str, *, assume_yes: bool = False) -> None:
+    records = display_records()
+    if not records:
+        raise AmneziaShareError("No clients to remove")
+    record = select_record(selector, records)
+    cid = record["clientId"]
+
+    if not assume_yes and sys.stdin.isatty():
+        answer = input(f"Remove client '{record['name']}' ({cid[:12]}…)? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    container = detect_container()
+    info = parse_server_info(container)
+    old_table_raw = docker_read(container, CLIENTS_TABLE, optional=True)
+    table = load_clients_table(old_table_raw)
+    new_config, peer_removed = remove_peer(info.config_text, cid)
+    table_removed = remove_table_client(table, cid)
+
+    if not peer_removed and not table_removed:
+        raise AmneziaShareError("Client disappeared before removal")
+
+    backup = transaction_write(
+        container,
+        info.config_text,
+        new_config,
+        old_table_raw,
+        dump_clients_table(table),
+    )
+    remove_saved_profile(cid)
+    print(f"Removed: {record['name']} ({cid})")
+    print(f"Backup: {backup}")
+
+
+def load_profile_for_record(record: dict[str, Any]) -> dict[str, Any]:
+    saved = load_saved_profiles().get(record["clientId"])
+    if not saved or not isinstance(saved.get("profile"), dict):
+        raise AmneziaShareError(
+            "This client has no saved private profile on the VPS. clientsTable stores only the public client ID, "
+            "so an existing client created elsewhere cannot be re-shared. Create a new client instead."
+        )
+    return saved["profile"]
+
+
+# ---------------------------------- CLI ------------------------------------
+
+def add_qr_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--interval", type=float, default=1.0, help="seconds per QR frame (official GUI uses 1.0)")
+    p.add_argument("--chunk-size", default="auto", help="auto or bytes per Amnezia QR chunk; official size is 850")
+    p.add_argument(
+        "--qr-type",
+        default="ANSIUTF8",
+        choices=["ANSIUTF8", "UTF8", "ANSI256UTF8", "UTF8i", "ANSIUTF8i"],
+        help="qrencode terminal renderer",
+    )
+    p.add_argument("--margin", type=int, default=1, help="QR quiet-zone modules (official SVG uses 1)")
+    p.add_argument("--keep-screen", action="store_true", help="do not clear the last QR on Ctrl+C")
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="amnezia-share",
+        description="Headless official-format AmneziaVPN AWG2/AWG3 sharing and client management",
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = p.add_subparsers(dest="command")
+
+    c = sub.add_parser("client", help="create a new AWG client and share it by QR or native .conf")
+    c.add_argument("name", help="client name for clientsTable")
+    c.add_argument("--host", help="public VPS IP/hostname; otherwise main default route, then ifconfig.me, then prompt")
+    c.add_argument("--dns1", default=DEFAULT_DNS1)
+    c.add_argument("--dns2", default=DEFAULT_DNS2)
+    c.add_argument("--mtu", default=DEFAULT_MTU)
+    c.add_argument(
+        "--conf", nargs="?", const="", metavar="FILE",
+        help="save native AWG .conf instead of QR; bare --conf writes ./<client>.conf",
+    )
+    add_qr_args(c)
+
+    f = sub.add_parser("full", help="show full-access official Amnezia dynamic QR")
+    f.add_argument("--host", help="public VPS IP/hostname; otherwise main default route, then ifconfig.me, then prompt")
+    f.add_argument("--description", default="Amnezia VPS")
+    f.add_argument("--ssh-user", help="local SSH user to authorize; defaults to root when run as root")
+    f.add_argument("--ssh-port", type=int)
+    f.add_argument("--dns1", default=None)
+    f.add_argument("--dns2", default=None)
+    add_qr_args(f)
+
+    sub.add_parser("list", help="list AWG clients from clientsTable/server config")
+    sub.add_parser("full-list", help="list Full Access SSH keys generated by this helper")
+    fr = sub.add_parser("full-revoke", help="revoke a generated Full Access SSH key")
+    fr.add_argument("selector", help="full-access ID or unique ID prefix")
+
+    r = sub.add_parser("remove", help="remove a client peer and its clientsTable row")
+    r.add_argument("selector", help="list number, exact client name, or public-key prefix")
+    r.add_argument("-y", "--yes", action="store_true")
+
+    rs = sub.add_parser("reshare", help="re-display a client profile created by this helper")
+    rs.add_argument("selector", help="list number, exact client name, or public-key prefix")
+    add_qr_args(rs)
+
+    u = sub.add_parser("url", help="print saved client's vpn:// URL (contains client private key)")
+    u.add_argument("selector", help="list number, exact client name, or public-key prefix")
+
+    d = sub.add_parser("doctor", help="check container/version/files/dependencies without modifying anything")
+    return p
+
+
+def run_doctor() -> None:
+    require_binary("docker", "apt install docker.io")
+    print(f"docker: {shutil.which('docker')}")
+    print(f"qrencode: {shutil.which('qrencode') or 'NOT INSTALLED'}")
+    print(f"ssh-keygen: {shutil.which('ssh-keygen') or 'NOT INSTALLED'}")
+    print(f"ip: {shutil.which('ip') or 'NOT INSTALLED'}")
+    print(f"curl: {shutil.which('curl') or 'NOT INSTALLED (host fallback will require --host/manual input)'}")
+    container = detect_container()
+    print(f"container: {container}")
+    info = parse_server_info(container)
+    print(f"AWG version: {info.version or 'unknown'}")
+    print(f"config: {AWG_CONFIG}")
+    print(f"VPN endpoint port: {info.vpn_port}/udp")
+    print(f"subnet: {info.subnet_address}/{info.subnet_cidr}")
+    print(f"server public key: {info.server_public_key}")
+    print(f"clientsTable: {'present' if docker_file_exists(container, CLIENTS_TABLE) else 'missing (will be created)'}")
+    print(f"state dir: {state_dir()}")
+    if info.version not in ("2", "3"):
+        raise AmneziaShareError("Only AWG2/AWG3 are supported by this build")
+    if not shutil.which("qrencode"):
+        print("\nInstall QR renderer: apt update && apt install -y qrencode")
+    else:
+        print("\nDoctor: OK")
+
+
+def interactive_menu() -> None:
+    while True:
+        print("\nAmnezia VPS Share")
+        print("1. Share client access (create new client)")
+        print("2. Share full access")
+        print("3. List clients")
+        print("4. Re-share existing helper-created client")
+        print("5. Remove client")
+        print("6. Doctor")
+        print("7. List generated Full Access SSH keys")
+        print("8. Revoke generated Full Access SSH key")
+        print("0. Exit")
+        choice = input("Select: ").strip()
+        try:
+            if choice == "0":
+                return
+            if choice == "1":
+                name = input("Client name: ").strip()
+                if not name:
+                    print("Client name cannot be empty")
+                    continue
+                require_binary("qrencode", "apt update && apt install -y qrencode")
+                host = detect_host(None)
+                material = create_client(name, host=host, dns1=DEFAULT_DNS1, dns2=DEFAULT_DNS2, mtu=DEFAULT_MTU)
+                show_dynamic_qr(material.profile, title=f"Amnezia client access: {name}")
+            elif choice == "2":
+                require_binary("qrencode", "apt update && apt install -y qrencode")
+                if not sys.stdout.isatty():
+                    raise AmneziaShareError("Dynamic QR output requires a TTY/PTY")
+                container = detect_container()
+                info = parse_server_info(container)
+                host = detect_host(None)
+                ssh_user = detect_ssh_user(None)
+                ssh_port = detect_ssh_port(None)
+                access_id = None
+                try:
+                    access_id, private_key, auth_path = generate_full_access_ssh_key(
+                        ssh_user=ssh_user, host=host, ssh_port=ssh_port
+                    )
+                    profile = build_full_profile(
+                        info,
+                        description="Amnezia VPS",
+                        host=host,
+                        ssh_user=ssh_user,
+                        ssh_secret=private_key,
+                        ssh_port=ssh_port,
+                    )
+                    print(f"Generated Full Access SSH key: {access_id}")
+                    print(f"Authorized for {ssh_user} in {auth_path}")
+                    show_dynamic_qr(profile, title=f"Amnezia FULL access: {host} | ID {access_id}")
+                except Exception:
+                    if access_id:
+                        try:
+                            revoke_full_access(access_id)
+                        except Exception:
+                            pass
+                    raise
+            elif choice == "3":
+                print_clients()
+            elif choice == "4":
+                records = print_clients()
+                if records:
+                    selector = input("Client number/name/key prefix: ").strip()
+                    record = select_record(selector, records)
+                    profile = load_profile_for_record(record)
+                    show_dynamic_qr(profile, title=f"Amnezia client access: {record['name']}")
+            elif choice == "5":
+                records = print_clients()
+                if records:
+                    selector = input("Client number/name/key prefix: ").strip()
+                    remove_client(selector)
+            elif choice == "6":
+                run_doctor()
+            elif choice == "7":
+                print_full_access_records()
+            elif choice == "8":
+                records = print_full_access_records()
+                if records:
+                    selector = input("Full Access ID/prefix: ").strip()
+                    revoke_full_access(selector)
+            else:
+                print("Unknown option")
+        except AmneziaShareError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if not args.command:
+            if not sys.stdin.isatty():
+                parser().print_help()
+                return 2
+            interactive_menu()
+            return 0
+
+        if args.command == "doctor":
+            run_doctor()
+            return 0
+
+        if args.command == "list":
+            print_clients()
+            return 0
+
+        if args.command == "full-list":
+            print_full_access_records()
+            return 0
+
+        if args.command == "full-revoke":
+            revoke_full_access(args.selector)
+            return 0
+
+        if args.command == "remove":
+            remove_client(args.selector, assume_yes=args.yes)
+            return 0
+
+        if args.command == "client":
+            conf_path = resolve_conf_output(args.name, args.conf) if args.conf is not None else None
+            if conf_path is None:
+                # Check before mutating the server; QR mode requires qrencode.
+                require_binary("qrencode", "apt update && apt install -y qrencode")
+
+            host = detect_host(args.host)
+            material = create_client(
+                args.name,
+                host=host,
+                dns1=args.dns1,
+                dns2=args.dns2,
+                mtu=args.mtu,
+            )
+
+            if conf_path is not None:
+                try:
+                    write_client_conf(material.profile, conf_path)
+                except Exception as export_error:
+                    # Do not leave a newly-created peer behind if the requested
+                    # private-key config could not be written.
+                    try:
+                        remove_client(material.client_public_key, assume_yes=True)
+                    except Exception as rollback_error:
+                        raise AmneziaShareError(
+                            f"Could not write {conf_path}: {export_error}; "
+                            f"client rollback also failed: {rollback_error}"
+                        ) from export_error
+                    raise AmneziaShareError(f"Could not write {conf_path}: {export_error}") from export_error
+                print(f"Native AWG config (0600): {conf_path}")
+            else:
+                show_dynamic_qr(
+                    material.profile,
+                    title=f"Amnezia client access: {args.name} | AWG",
+                    interval=args.interval,
+                    chunk_size=args.chunk_size,
+                    qr_type=args.qr_type,
+                    margin=args.margin,
+                    keep_screen=args.keep_screen,
+                )
+            return 0
+
+        if args.command == "full":
+            require_binary("qrencode", "apt update && apt install -y qrencode")
+            if not sys.stdout.isatty():
+                raise AmneziaShareError("Dynamic QR output requires a TTY/PTY (for SSH use: ssh -t ...)")
+            container = detect_container()
+            info = parse_server_info(container)
+            if info.version not in ("2", "3"):
+                raise AmneziaShareError(f"Unsupported AWG version: {info.version or 'unknown'}")
+            host = detect_host(args.host)
+            ssh_port = detect_ssh_port(args.ssh_port)
+            ssh_user = detect_ssh_user(args.ssh_user)
+            access_id = None
+            try:
+                access_id, private_key, auth_path = generate_full_access_ssh_key(
+                    ssh_user=ssh_user, host=host, ssh_port=ssh_port
+                )
+                profile = build_full_profile(
+                    info,
+                    description=args.description,
+                    host=host,
+                    ssh_user=ssh_user,
+                    ssh_secret=private_key,
+                    ssh_port=ssh_port,
+                    dns1=args.dns1,
+                    dns2=args.dns2,
+                )
+                print(f"Generated Full Access SSH key: {access_id}")
+                print(f"Authorized for {ssh_user} in {auth_path}")
+                print(f"Revoke later with: amnezia-share full-revoke {access_id}")
+                show_dynamic_qr(
+                    profile,
+                    title=f"Amnezia FULL access: {host} | ID {access_id}",
+                    interval=args.interval,
+                    chunk_size=args.chunk_size,
+                    qr_type=args.qr_type,
+                    margin=args.margin,
+                    keep_screen=args.keep_screen,
+                )
+            except Exception:
+                if access_id:
+                    try:
+                        revoke_full_access(access_id)
+                    except Exception:
+                        pass
+                raise
+            return 0
+
+        if args.command in ("reshare", "url"):
+            records = display_records()
+            record = select_record(args.selector, records)
+            profile = load_profile_for_record(record)
+            if args.command == "url":
+                print(vpn_url(profile))
+                return 0
+            show_dynamic_qr(
+                profile,
+                title=f"Amnezia client access: {record['name']}",
+                interval=args.interval,
+                chunk_size=args.chunk_size,
+                qr_type=args.qr_type,
+                margin=args.margin,
+                keep_screen=args.keep_screen,
+            )
+            return 0
+
+        raise AmneziaShareError("Unknown command")
+
+    except AmneziaShareError as e:
+        print(f"amnezia-share: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,118 @@
+# amnezia-share 0.2.2
+
+Headless AWG2/AWG3 client management with AmneziaVPN-compatible dynamic QR and native `.conf` export for an Amnezia VPS.
+
+Targets the current official Amnezia layout:
+
+- Docker container: `amnezia-awg2`
+- AWG2/AWG3 config: `/opt/amnezia/awg/awg0.conf`
+- clients table: `/opt/amnezia/awg/clientsTable`
+- multi-QR framing compatible with the official Amnezia client
+
+## Install
+
+```bash
+sudo ./install.sh
+amnezia-share doctor
+```
+
+## Endpoint auto-detection
+
+`--host` is optional. The endpoint host is resolved in this order:
+
+1. Explicit `--host`, if supplied.
+2. A public IPv4 address assigned to the interface used by the host's `main` default route (or its explicit `src`).
+3. `curl -4 https://ifconfig.me/ip`.
+4. Interactive prompt if automatic detection fails.
+
+`SSH_CONNECTION` is not used for endpoint or SSH-port detection.
+
+Examples:
+
+```bash
+amnezia-share client phone
+amnezia-share full
+```
+
+Override only when needed:
+
+```bash
+amnezia-share client phone --host vpn.example.com
+amnezia-share full --host 203.0.113.10
+```
+
+## Client access
+
+Creates a fresh AWG client peer, updates `clientsTable`, applies `awg syncconf`, and shows a dynamic QR understood by AmneziaVPN:
+
+```bash
+amnezia-share client phone
+```
+
+Export the same kind of native AWG `.conf` that the official client can share:
+
+```bash
+amnezia-share client phone --conf
+```
+
+Bare `--conf` writes `./phone.conf` with mode `0600` and does not require `qrencode`. You can also choose a path:
+
+```bash
+amnezia-share client phone --conf /root/phone.conf
+```
+
+The exported native config has the real DNS values substituted, matching the official native-export path.
+
+List/remove/re-share clients created by the helper:
+
+```bash
+amnezia-share list
+amnezia-share reshare phone
+amnezia-share remove phone
+```
+
+## Full access
+
+`full` does **not** require an existing SSH private key. It generates a dedicated Ed25519 key pair, adds the public key to the selected local user's `authorized_keys`, puts the private key only into the generated Full Access Amnezia config/QR, and then deletes the temporary private-key file.
+
+```bash
+amnezia-share full
+```
+
+When run as root, the SSH user defaults to `root`. Override if needed. SSH port defaults to 22 and is only changed explicitly (or with `AMNEZIA_SSH_PORT`):
+
+```bash
+amnezia-share full --ssh-user ubuntu --ssh-port 2222
+```
+
+Each generated Full Access key gets an ID such as `9fb13d6ee342` and an `authorized_keys` comment `amnezia-share-full:<ID>`.
+
+List and revoke only keys created by this helper:
+
+```bash
+amnezia-share full-list
+amnezia-share full-revoke 9fb13d6ee342
+```
+
+The private Full Access key is deliberately **not** saved under `/var/lib/amnezia-share`; only non-secret metadata and the public key are kept so it can later be revoked. To share Full Access again, generate a new one and revoke the old one if desired.
+
+## State
+
+Root mode uses:
+
+```text
+/var/lib/amnezia-share/
+├── clients/       # helper-created AWG client profiles (0600, needed for re-share)
+├── full-access/   # metadata/public keys only; no Full Access private keys
+└── backups/       # recent awg0.conf + clientsTable backups
+```
+
+## Terminal QR
+
+The official Amnezia GUI uses 850-byte chunks and one frame per second. The helper uses the same format; `--chunk-size auto` may choose a smaller compatible chunk so the QR fits an SSH terminal.
+
+If rendering is poor:
+
+```bash
+amnezia-share client phone --qr-type UTF8
+```
