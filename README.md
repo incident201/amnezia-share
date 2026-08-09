@@ -1,4 +1,4 @@
-# amnezia-share 0.2.2
+# amnezia-share 0.2.3
 
 Headless AWG2/AWG3 client management with AmneziaVPN-compatible dynamic QR and native `.conf` export for an Amnezia VPS.
 
@@ -61,7 +61,14 @@ Bare `--conf` writes `./phone.conf` with mode `0600` and does not require `qrenc
 amnezia-share client phone --conf /root/phone.conf
 ```
 
-The exported native config has the real DNS values substituted and writes the selected MTU in the standard `[Interface]` section (default: `1280`). The resulting `.conf` can be imported by the official Amnezia Client.
+MTU defaults to `1280` for both QR profiles and native `.conf` exports. Override it when needed:
+
+```bash
+amnezia-share client phone --mtu 1420
+amnezia-share client phone --mtu 1420 --conf
+```
+
+The accepted range matches Amnezia Client: `576–65535`. Invalid values are rejected before `awg0.conf` or `clientsTable` is changed. In QR profiles MTU is stored as the official `last_config.mtu` field; native exports additionally write `MTU = ...` in `[Interface]`. The `.conf` also has the real DNS values substituted and can be imported by the official Amnezia Client.
 
 List/remove/re-share clients created by the helper:
 

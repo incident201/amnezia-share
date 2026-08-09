@@ -34,6 +34,28 @@ class TTYBuffer(io.StringIO):
 
 
 class TerminalQrTests(unittest.TestCase):
+    def test_mtu_validation_matches_official_range(self):
+        self.assertEqual(amnezia_share.validate_mtu("576"), "576")
+        self.assertEqual(amnezia_share.validate_mtu("1280"), "1280")
+        self.assertEqual(amnezia_share.validate_mtu("65535"), "65535")
+
+        for value in ("575", "65536", "invalid", ""):
+            with self.subTest(value=value), self.assertRaises(
+                amnezia_share.AmneziaShareError
+            ):
+                amnezia_share.validate_mtu(value)
+
+    def test_invalid_cli_mtu_is_rejected_before_client_creation(self):
+        stderr = io.StringIO()
+        with mock.patch.object(amnezia_share, "create_client") as create_client, mock.patch(
+            "sys.stderr", stderr
+        ), self.assertRaises(SystemExit) as raised:
+            amnezia_share.main(["client", "phone", "--mtu", "575"])
+
+        self.assertEqual(raised.exception.code, 2)
+        create_client.assert_not_called()
+        self.assertIn("MTU must be from 576 to 65535", stderr.getvalue())
+
     def test_qr_profile_carries_mtu_in_amnezia_last_config(self):
         info = amnezia_share.ServerInfo(
             container="amnezia-awg2",

@@ -60,6 +60,8 @@ QR_LAYOUT_LINES = 5
 DEFAULT_DNS1 = "1.1.1.1"
 DEFAULT_DNS2 = "1.0.0.1"
 DEFAULT_MTU = "1280"
+MIN_MTU = 576
+MAX_MTU = 65535
 
 AWG_KEYS = [
     "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
@@ -83,6 +85,27 @@ ASSIGN_ACTIVE_RE = re.compile(r"^\s*([^#=\s][^=\s]*)\s*=\s*(.*?)\s*$")
 
 class AmneziaShareError(RuntimeError):
     pass
+
+
+def validate_mtu(value: Any) -> str:
+    mtu = str(value).strip()
+    if not mtu.isdecimal():
+        raise AmneziaShareError(
+            f"MTU must be an integer from {MIN_MTU} to {MAX_MTU}"
+        )
+    number = int(mtu)
+    if not MIN_MTU <= number <= MAX_MTU:
+        raise AmneziaShareError(
+            f"MTU must be from {MIN_MTU} to {MAX_MTU}; got {mtu}"
+        )
+    return str(number)
+
+
+def argparse_mtu(value: str) -> str:
+    try:
+        return validate_mtu(value)
+    except AmneziaShareError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 @dataclass
@@ -1238,9 +1261,7 @@ def native_client_config(profile: dict[str, Any]) -> str:
     # Amnezia stores MTU separately in last_config. Native .conf import also
     # recognizes the standard WireGuard `MTU` key, so materialize it in the
     # [Interface] section for a self-contained export without changing QR data.
-    mtu = str(inner.get("mtu") or DEFAULT_MTU).strip()
-    if not mtu.isdecimal() or not (1 <= int(mtu) <= 65535):
-        raise AmneziaShareError(f"Invalid MTU value in profile: {mtu!r}")
+    mtu = validate_mtu(inner.get("mtu") or DEFAULT_MTU)
 
     lines = config.splitlines()
     interface_index = next(
@@ -1327,6 +1348,9 @@ def write_client_conf(profile: dict[str, Any], path: Path) -> None:
 
 
 def create_client(name: str, *, host: str, dns1: str, dns2: str, mtu: str) -> ClientMaterial:
+    # Validate before reading or changing any server-side client state. argparse
+    # already does this for CLI calls; this also protects programmatic/menu use.
+    mtu = validate_mtu(mtu)
     container = detect_container()
     info = parse_server_info(container)
     if info.version not in ("2", "3"):
@@ -1527,7 +1551,13 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--host", help="public VPS IP/hostname; otherwise main default route, then ifconfig.me, then prompt")
     c.add_argument("--dns1", default=DEFAULT_DNS1)
     c.add_argument("--dns2", default=DEFAULT_DNS2)
-    c.add_argument("--mtu", default=DEFAULT_MTU)
+    c.add_argument(
+        "--mtu",
+        type=argparse_mtu,
+        default=DEFAULT_MTU,
+        metavar="576..65535",
+        help=f"client MTU (default: {DEFAULT_MTU}; official range: {MIN_MTU}-{MAX_MTU})",
+    )
     c.add_argument(
         "--conf", nargs="?", const="", metavar="FILE",
         help="save native AWG .conf instead of QR; bare --conf writes ./<client>.conf",
