@@ -49,6 +49,18 @@ Creates a fresh AWG client peer, updates `clientsTable`, applies `awg syncconf`,
 amnezia-share client phone
 ```
 
+The positional name is the peer/device name written to `clientsTable` (`clientName`). The Amnezia connection name (`description`) defaults independently to `Amnezia VPS`:
+
+```bash
+# clientsTable clientName: Ipad13; Amnezia connection: Amnezia VPS
+amnezia-share client Ipad13
+
+# clientsTable clientName: Ipad13; Amnezia connection: VPS Netherlands
+amnezia-share client Ipad13 --description "VPS Netherlands"
+```
+
+`--description` does not affect the saved client name, list output, re-share selectors, or removal selectors. Full Access uses `--description` with the same connection-name meaning.
+
 Export the same kind of native AWG `.conf` that the official client can share:
 
 ```bash

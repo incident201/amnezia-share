@@ -34,6 +34,68 @@ class TTYBuffer(io.StringIO):
 
 
 class TerminalQrTests(unittest.TestCase):
+    def test_client_cli_separates_peer_name_and_connection_description(self):
+        default = amnezia_share.parser().parse_args(["client", "Ipad13"])
+        custom = amnezia_share.parser().parse_args(
+            ["client", "Ipad13", "--description", "VPS Netherlands"]
+        )
+
+        self.assertEqual(default.name, "Ipad13")
+        self.assertEqual(default.description, "Amnezia VPS")
+        self.assertEqual(custom.name, "Ipad13")
+        self.assertEqual(custom.description, "VPS Netherlands")
+
+    def test_create_client_keeps_description_out_of_peer_identity(self):
+        info = amnezia_share.ServerInfo(
+            container="amnezia-awg2",
+            config_text="[Interface]\n",
+            interface={},
+            version="2",
+            vpn_port="55424",
+            subnet_address="10.8.1.0",
+            subnet_cidr="24",
+            server_public_key="server-public",
+            psk="preshared",
+        )
+        table = []
+        profile = {"description": "VPS Netherlands"}
+
+        with mock.patch.object(
+            amnezia_share, "detect_container", return_value="amnezia-awg2"
+        ), mock.patch.object(
+            amnezia_share, "parse_server_info", return_value=info
+        ), mock.patch.object(
+            amnezia_share, "docker_read", return_value="[]"
+        ), mock.patch.object(
+            amnezia_share, "load_clients_table", return_value=table
+        ), mock.patch.object(
+            amnezia_share, "official_next_client_ip", return_value="10.8.1.2"
+        ), mock.patch.object(
+            amnezia_share, "generate_client_keys", return_value=("private", "public")
+        ), mock.patch.object(
+            amnezia_share, "build_client_profile", return_value=profile
+        ) as build_profile, mock.patch.object(
+            amnezia_share, "append_peer", return_value="updated config"
+        ), mock.patch.object(
+            amnezia_share, "transaction_write", return_value=Path("backup")
+        ), mock.patch.object(
+            amnezia_share, "save_client_profile", return_value=Path("saved")
+        ) as save_profile, mock.patch("builtins.print"):
+            material = amnezia_share.create_client(
+                "Ipad13",
+                description="VPS Netherlands",
+                host="vpn.example.com",
+                dns1="1.1.1.1",
+                dns2="1.0.0.1",
+                mtu="1280",
+            )
+
+        self.assertEqual(table[0]["userData"]["clientName"], "Ipad13")
+        self.assertEqual(material.name, "Ipad13")
+        self.assertEqual(material.profile["description"], "VPS Netherlands")
+        self.assertEqual(build_profile.call_args.kwargs["description"], "VPS Netherlands")
+        save_profile.assert_called_once_with(material)
+
     def test_mtu_validation_matches_official_range(self):
         self.assertEqual(amnezia_share.validate_mtu("576"), "576")
         self.assertEqual(amnezia_share.validate_mtu("1280"), "1280")
@@ -70,7 +132,7 @@ class TerminalQrTests(unittest.TestCase):
         )
         profile = amnezia_share.build_client_profile(
             info,
-            name="phone",
+            description="VPS Netherlands",
             host="vpn.example.com",
             client_ip="10.8.1.2",
             private_key="client-private",
@@ -84,6 +146,7 @@ class TerminalQrTests(unittest.TestCase):
         decoded_profile = json.loads(amnezia_share.zlib.decompress(compressed[4:]))
         last_config = json.loads(decoded_profile["containers"][0]["awg"]["last_config"])
 
+        self.assertEqual(decoded_profile["description"], "VPS Netherlands")
         self.assertEqual(last_config["mtu"], "1280")
 
     def test_native_conf_writes_mtu_in_interface(self):
