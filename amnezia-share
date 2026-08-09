@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 CURRENT_CONTAINER = "amnezia-awg2"
 LEGACY_CONTAINER = "amnezia-awg"
@@ -53,9 +53,13 @@ AWG_INTERFACE = "awg0"
 
 QR_MAGIC = 1984
 OFFICIAL_QR_CHUNK = 850
+QR_TARGET_RATIO = 0.78
+QR_LEFT_PADDING = 4
+# Title, frame counter, blank line above the QR, blank line below it, stop hint.
+QR_LAYOUT_LINES = 5
 DEFAULT_DNS1 = "1.1.1.1"
 DEFAULT_DNS2 = "1.0.0.1"
-DEFAULT_MTU = "1376"  # official non-mobile default
+DEFAULT_MTU = "1280"
 
 AWG_KEYS = [
     "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
@@ -810,7 +814,7 @@ def visible_size(rendered: str) -> tuple[int, int]:
 
 
 def choose_chunk_size(data: bytes, requested: str, qr_type: str, margin: int,
-                      header_lines: int = 3) -> tuple[int, tuple[int, int]]:
+                      target_ratio: float = QR_TARGET_RATIO) -> tuple[int, tuple[int, int]]:
     if requested != "auto":
         try:
             size = int(requested)
@@ -821,21 +825,64 @@ def choose_chunk_size(data: bytes, requested: str, qr_type: str, margin: int,
         return size, visible_size(rendered)
 
     cols, rows = shutil.get_terminal_size((120, 60))
-    candidates = [850, 760, 680, 600, 520, 440, 360, 300, 256, 224, 192, 160, 128, 112, 96, 80, 64]
-    last_valid: tuple[int, tuple[int, int]] | None = None
-    for size in candidates:
-        try:
-            payloads = qr_payloads(data, size)
-        except AmneziaShareError:
-            continue
-        rendered = render_qr(payloads[0], qr_type, margin)
-        wh = visible_size(rendered)
-        last_valid = (size, wh)
-        if wh[0] <= cols and wh[1] + header_lines <= rows:
-            return size, wh
-    if last_valid:
-        return last_valid
-    raise AmneziaShareError("Could not choose a valid QR chunk size")
+    target_width = max(1, min(cols - QR_LEFT_PADDING, int(cols * target_ratio)))
+    target_height = max(1, min(rows - QR_LAYOUT_LINES, int(rows * target_ratio)))
+
+    # QR dimensions grow monotonically with the payload. Find the largest chunk
+    # that stays near 78% of both terminal dimensions. An integer search avoids
+    # the large jumps of a fixed candidate list and may deliberately yield more
+    # frames in exchange for a comfortably scannable QR.
+    minimum = max(1, (len(data) + 254) // 255)
+    maximum = max(OFFICIAL_QR_CHUNK, minimum)
+    best: tuple[int, tuple[int, int]] | None = None
+    smallest: tuple[int, tuple[int, int]] | None = None
+    low, high = minimum, maximum
+    while low <= high:
+        size = (low + high) // 2
+        payloads = qr_payloads(data, size)
+        wh = visible_size(render_qr(payloads[0], qr_type, margin))
+        if size == minimum:
+            smallest = (size, wh)
+        if wh[0] <= target_width and wh[1] <= target_height:
+            best = (size, wh)
+            low = size + 1
+        else:
+            high = size - 1
+
+    if best:
+        return best
+    if smallest is None:
+        payloads = qr_payloads(data, minimum)
+        smallest = (minimum, visible_size(render_qr(payloads[0], qr_type, margin)))
+    return smallest
+
+
+def _fit_status_line(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[:width - 3] + "..."
+
+
+def dynamic_qr_frame(rendered: str, *, title: str, index: int, count: int,
+                     terminal_width: int, left_padding: int = QR_LEFT_PADDING) -> str:
+    indent = " " * left_padding
+    status_width = max(0, terminal_width - left_padding)
+    qr_lines = rendered.rstrip("\r\n").splitlines()
+    lines = [
+        indent + _fit_status_line(title, status_width),
+        indent + _fit_status_line(f"Frame {index + 1}/{count}", status_width),
+        "",  # one row of external padding above the QR
+        *(indent + line for line in qr_lines),
+        "",
+        indent + _fit_status_line("Ctrl+C to stop", status_width),
+    ]
+    # No trailing newline: writing one on the terminal's bottom row can scroll
+    # the screen and leave pieces of the previous frame behind.
+    return "\n".join(lines)
 
 
 def show_dynamic_qr(profile: dict[str, Any], *, title: str,
@@ -849,7 +896,7 @@ def show_dynamic_qr(profile: dict[str, Any], *, title: str,
     payloads = qr_payloads(data, size)
     cols, rows = shutil.get_terminal_size((120, 60))
 
-    if measured[0] > cols or measured[1] + 3 > rows:
+    if measured[0] + QR_LEFT_PADDING > cols or measured[1] + QR_LAYOUT_LINES > rows:
         print(
             f"Warning: terminal is smaller than the QR output "
             f"(terminal {cols}x{rows}, QR about {measured[0]}x{measured[1]}).\n"
@@ -858,27 +905,35 @@ def show_dynamic_qr(profile: dict[str, Any], *, title: str,
         )
         time.sleep(1.5)
 
+    last_frame = ""
+    alternate_screen = False
     try:
-        sys.stdout.write("\033[?25l")  # hide cursor
+        # The alternate buffer prevents redraws from accumulating in terminal
+        # history. Each frame is still fully cleared for terminal compatibility.
+        sys.stdout.write("\033[?1049h\033[?25l")
         sys.stdout.flush()
+        alternate_screen = True
         index = 0
         while True:
             rendered = render_qr(payloads[index], qr_type, margin)
-            sys.stdout.write("\033[2J\033[H")
-            sys.stdout.write(
-                f"{title}\n"
-                f"Frame {index + 1}/{len(payloads)} | chunk={size} | "
-                f"interval={interval:g}s | Ctrl+C to stop\n\n"
+            last_frame = dynamic_qr_frame(
+                rendered,
+                title=title,
+                index=index,
+                count=len(payloads),
+                terminal_width=cols,
             )
-            sys.stdout.write(rendered)
+            sys.stdout.write("\033[2J\033[H" + last_frame)
             sys.stdout.flush()
             time.sleep(interval)
             index = (index + 1) % len(payloads)
     except KeyboardInterrupt:
         pass
     finally:
-        if not keep_screen:
-            sys.stdout.write("\033[2J\033[H")
+        if alternate_screen:
+            sys.stdout.write("\033[?1049l")
+        if keep_screen and last_frame:
+            sys.stdout.write(last_frame + "\n")
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 

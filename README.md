@@ -109,7 +109,7 @@ Root mode uses:
 
 ## Terminal QR
 
-The official Amnezia GUI uses 850-byte chunks and one frame per second. The helper uses the same format; `--chunk-size auto` may choose a smaller compatible chunk so the QR fits an SSH terminal.
+The official Amnezia GUI uses 850-byte chunks and one frame per second. The helper uses the same data format; `--chunk-size auto` chooses the largest compatible chunk whose QR is about 78% of the terminal width and height. This leaves a small outer padding and may produce more frames, but makes scanning over SSH more reliable. Dynamic redraws use the terminal's alternate screen so old frames do not accumulate.
 
 If rendering is poor:
 
