@@ -61,7 +61,7 @@ Bare `--conf` writes `./phone.conf` with mode `0600` and does not require `qrenc
 amnezia-share client phone --conf /root/phone.conf
 ```
 
-The exported native config has the real DNS values substituted, matching the official native-export path.
+The exported native config has the real DNS values substituted and writes the selected MTU in the standard `[Interface]` section (default: `1280`). The resulting `.conf` can be imported by the official Amnezia Client.
 
 List/remove/re-share clients created by the helper:
 

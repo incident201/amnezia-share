@@ -2,6 +2,7 @@ import base64
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import struct
@@ -33,6 +34,86 @@ class TTYBuffer(io.StringIO):
 
 
 class TerminalQrTests(unittest.TestCase):
+    def test_qr_profile_carries_mtu_in_amnezia_last_config(self):
+        info = amnezia_share.ServerInfo(
+            container="amnezia-awg2",
+            config_text="[Interface]\n",
+            interface={},
+            version="2",
+            vpn_port="55424",
+            subnet_address="10.8.1.0",
+            subnet_cidr="24",
+            server_public_key="server-public",
+            psk="preshared",
+        )
+        profile = amnezia_share.build_client_profile(
+            info,
+            name="phone",
+            host="vpn.example.com",
+            client_ip="10.8.1.2",
+            private_key="client-private",
+            public_key="client-public",
+            dns1="1.1.1.1",
+            dns2="1.0.0.1",
+            mtu="1280",
+        )
+
+        compressed = amnezia_share.qt_compress(amnezia_share.qt_json_bytes(profile))
+        decoded_profile = json.loads(amnezia_share.zlib.decompress(compressed[4:]))
+        last_config = json.loads(decoded_profile["containers"][0]["awg"]["last_config"])
+
+        self.assertEqual(last_config["mtu"], "1280")
+
+    def test_native_conf_writes_mtu_in_interface(self):
+        native = (
+            "[Interface]\n"
+            "Address = 10.8.1.2/32\n"
+            "DNS = $PRIMARY_DNS, $SECONDARY_DNS\n"
+            "PrivateKey = private\n\n"
+            "[Peer]\n"
+            "PublicKey = public\n"
+        )
+        profile = {
+            "dns1": "1.1.1.1",
+            "dns2": "1.0.0.1",
+            "containers": [
+                {
+                    "awg": {
+                        "last_config": json.dumps({"config": native, "mtu": "1280"})
+                    }
+                }
+            ],
+        }
+
+        exported = amnezia_share.native_client_config(profile)
+        interface, peer = exported.split("[Peer]", 1)
+
+        self.assertIn("DNS = 1.1.1.1, 1.0.0.1", interface)
+        self.assertIn("MTU = 1280", interface)
+        self.assertNotIn("MTU", peer)
+        self.assertEqual(exported.count("MTU ="), 1)
+
+    def test_native_conf_replaces_existing_mtu_without_duplication(self):
+        native = "[Interface]\nAddress = 10.8.1.2/32\nMTU = 1376\nPrivateKey = key\n\n[Peer]\n"
+        profile = {
+            "containers": [
+                {
+                    "awg": {
+                        "last_config": {
+                            "config": native,
+                            "mtu": "1280",
+                        }
+                    }
+                }
+            ],
+        }
+
+        exported = amnezia_share.native_client_config(profile)
+
+        self.assertIn("MTU = 1280", exported)
+        self.assertNotIn("MTU = 1376", exported)
+        self.assertEqual(exported.count("MTU ="), 1)
+
     def test_qr_payload_framing_remains_amnezia_compatible(self):
         data = b"0123456789ABC"
         payloads = amnezia_share.qr_payloads(data, 5)

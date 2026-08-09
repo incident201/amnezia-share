@@ -1234,6 +1234,47 @@ def native_client_config(profile: dict[str, Any]) -> str:
     # these substitutions before native .conf export.
     config = config.replace("$PRIMARY_DNS", dns1).replace("$SECONDARY_DNS", dns2)
     config = config.replace("\r", "")
+
+    # Amnezia stores MTU separately in last_config. Native .conf import also
+    # recognizes the standard WireGuard `MTU` key, so materialize it in the
+    # [Interface] section for a self-contained export without changing QR data.
+    mtu = str(inner.get("mtu") or DEFAULT_MTU).strip()
+    if not mtu.isdecimal() or not (1 <= int(mtu) <= 65535):
+        raise AmneziaShareError(f"Invalid MTU value in profile: {mtu!r}")
+
+    lines = config.splitlines()
+    interface_index = next(
+        (i for i, line in enumerate(lines) if line.strip().casefold() == "[interface]"),
+        None,
+    )
+    if interface_index is None:
+        raise AmneziaShareError("Native AWG config has no [Interface] section")
+
+    section_end = next(
+        (i for i in range(interface_index + 1, len(lines)) if lines[i].strip().startswith("[")),
+        len(lines),
+    )
+    mtu_line = f"MTU = {mtu}"
+    existing_mtu = next(
+        (
+            i for i in range(interface_index + 1, section_end)
+            if lines[i].partition("=")[0].strip().casefold() == "mtu"
+        ),
+        None,
+    )
+    if existing_mtu is not None:
+        lines[existing_mtu] = mtu_line
+    else:
+        # Keep the common wg-quick order: Address, DNS, MTU, PrivateKey.
+        insert_at = interface_index + 1
+        for i in range(interface_index + 1, section_end):
+            key = lines[i].partition("=")[0].strip().casefold()
+            if key in ("address", "dns"):
+                insert_at = i + 1
+            elif key == "privatekey":
+                break
+        lines.insert(insert_at, mtu_line)
+    config = "\n".join(lines)
     return config.rstrip("\n") + "\n"
 
 
