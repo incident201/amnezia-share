@@ -155,11 +155,12 @@ class TerminalQrTests(unittest.TestCase):
             "RandomTrailers = on\n"
             "DisableCookies = on\n"
         )
+        interface = amnezia_share.interface_values(config_text)
         info = amnezia_share.ServerInfo(
             container="amnezia-awg2",
             config_text=config_text,
-            interface=amnezia_share.interface_values(config_text),
-            version="3",
+            interface=interface,
+            version=amnezia_share.detect_awg_version(interface),
             vpn_port="55424",
             subnet_address="10.8.1.0",
             subnet_cidr="24",
@@ -176,6 +177,7 @@ class TerminalQrTests(unittest.TestCase):
         )
         self.assertIn("RandomTrailers = on", native)
         self.assertIn("DisableCookies = on", native)
+        self.assertIn("PersistentKeepalive = 25-35", native)
 
         profile = amnezia_share.build_client_profile(
             info,
@@ -188,9 +190,20 @@ class TerminalQrTests(unittest.TestCase):
             dns2="1.0.0.1",
             mtu="1280",
         )
-        last_config = json.loads(profile["containers"][0]["awg"]["last_config"])
+        compressed = amnezia_share.qt_compress(amnezia_share.qt_json_bytes(profile))
+        decoded_profile = json.loads(amnezia_share.zlib.decompress(compressed[4:]))
+        client_awg = decoded_profile["containers"][0]["awg"]
+        self.assertEqual(client_awg["protocol_version"], "3.1")
+        last_config = json.loads(client_awg["last_config"])
         self.assertEqual(last_config["RandomTrailers"], "on")
         self.assertEqual(last_config["DisableCookies"], "on")
+        self.assertEqual(last_config["persistent_keep_alive"], "25-35")
+        self.assertIn("PersistentKeepalive = 25-35", last_config["config"])
+
+        exported = amnezia_share.native_client_config(profile)
+        self.assertIn("RandomTrailers = on", exported)
+        self.assertIn("DisableCookies = on", exported)
+        self.assertIn("PersistentKeepalive = 25-35", exported)
 
         full_profile = amnezia_share.build_full_profile(
             info,
@@ -201,17 +214,18 @@ class TerminalQrTests(unittest.TestCase):
             ssh_port=22,
         )
         full_awg = full_profile["containers"][0]["awg"]
+        self.assertEqual(full_awg["protocol_version"], "3.1")
         self.assertEqual(full_awg["RandomTrailers"], "on")
         self.assertEqual(full_awg["DisableCookies"], "on")
 
     def test_awg_toggle_parameters_detect_awg3_only_when_enabled(self):
         self.assertEqual(
             amnezia_share.detect_awg_version({"RandomTrailers": "on"}),
-            "3",
+            "3.1",
         )
         self.assertEqual(
             amnezia_share.detect_awg_version({"DisableCookies": "on"}),
-            "3",
+            "3.1",
         )
         self.assertEqual(
             amnezia_share.detect_awg_version(
@@ -222,11 +236,15 @@ class TerminalQrTests(unittest.TestCase):
 
         self.assertEqual(
             amnezia_share.detect_awg_version({"HeaderProtectionKey": "key"}),
-            "3",
+            "3.1",
         )
         self.assertEqual(
             amnezia_share.detect_awg_version({"S3": "8"}),
             "2",
+        )
+        self.assertEqual(
+            amnezia_share.detect_awg_version({"I1": "example"}),
+            "1.5",
         )
 
     def test_native_conf_writes_mtu_in_interface(self):

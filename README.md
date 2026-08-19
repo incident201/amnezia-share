@@ -1,4 +1,4 @@
-# amnezia-share 0.2.3
+# amnezia-share 0.2.4
 
 Headless AWG2/AWG3/AWG3.1 client management with AmneziaVPN-compatible dynamic QR and native `.conf` export for an Amnezia VPS.
 

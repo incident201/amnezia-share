@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Headless AmneziaVPN AWG2/AWG3 sharing and client management for an Amnezia VPS.
+Headless AmneziaVPN AWG2/AWG3.1 sharing and client management for an Amnezia VPS.
 
 Compatibility target: official amnezia-vpn/amnezia-client self-hosted format.
-- AWG2/AWG3 container: amnezia-awg2
+- AWG2/AWG3.1 container: amnezia-awg2
 - server config: /opt/amnezia/awg/awg0.conf
 - clients table: /opt/amnezia/awg/clientsTable
 - client IDs: WireGuard/AWG public keys
@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 CURRENT_CONTAINER = "amnezia-awg2"
 LEGACY_CONTAINER = "amnezia-awg"
@@ -229,7 +229,7 @@ def detect_container() -> str:
         raise AmneziaShareError(
             "Detected legacy container amnezia-awg (AWG 1.x). "
             "This build intentionally targets the official current amnezia-awg2 container "
-            "used by AWG2 and AWG3."
+            "used by AWG2 and AWG3.1."
         )
     raise AmneziaShareError(
         "Amnezia AWG container not found. Expected Docker container: amnezia-awg2"
@@ -437,10 +437,10 @@ def awg_toggle_enabled(value: str) -> bool:
 def detect_awg_version(values: dict[str, str]) -> str:
     # Mirrors AwgProtocolConfig::awgVersionOf().
     if any(values.get(k, "").strip() for k in AWG3_KEYS):
-        return "3"
+        return "3.1"
 
     if any(awg_toggle_enabled(values.get(k, "")) for k in AWG3_TOGGLE_KEYS):
-        return "3"
+        return "3.1"
 
     has_junk_sizes = any(values.get(k, "").strip() for k in ("S3", "S4"))
     has_header_ranges = any("-" in values.get(k, "") for k in ("H1", "H2", "H3", "H4"))
@@ -718,7 +718,7 @@ def build_native_awg_config(info: ServerInfo, *, host: str, client_ip: str,
 def build_client_profile(info: ServerInfo, *, description: str, host: str,
                          client_ip: str, private_key: str, public_key: str,
                          dns1: str, dns2: str, mtu: str) -> dict[str, Any]:
-    persistent = "25-35" if info.version == "3" else "25"
+    persistent = "25-35" if info.version == "3.1" else "25"
     native = build_native_awg_config(
         info,
         host=host,
@@ -1370,9 +1370,9 @@ def create_client(name: str, *, description: str, host: str, dns1: str,
     mtu = validate_mtu(mtu)
     container = detect_container()
     info = parse_server_info(container)
-    if info.version not in ("2", "3"):
+    if info.version not in ("2", "3.1"):
         raise AmneziaShareError(
-            f"Detected AWG protocol version '{info.version or 'unknown'}'. This build supports AWG2/AWG3."
+            f"Detected AWG protocol version '{info.version or 'unknown'}'. This build supports AWG2/AWG3.1."
         )
 
     old_table_raw = docker_read(container, CLIENTS_TABLE, optional=True)
@@ -1558,7 +1558,7 @@ def add_qr_args(p: argparse.ArgumentParser) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="amnezia-share",
-        description="Headless official-format AmneziaVPN AWG2/AWG3 sharing and client management",
+        description="Headless official-format AmneziaVPN AWG2/AWG3.1 sharing and client management",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = p.add_subparsers(dest="command")
@@ -1632,8 +1632,8 @@ def run_doctor() -> None:
     print(f"server public key: {info.server_public_key}")
     print(f"clientsTable: {'present' if docker_file_exists(container, CLIENTS_TABLE) else 'missing (will be created)'}")
     print(f"state dir: {state_dir()}")
-    if info.version not in ("2", "3"):
-        raise AmneziaShareError("Only AWG2/AWG3 are supported by this build")
+    if info.version not in ("2", "3.1"):
+        raise AmneziaShareError("Only AWG2/AWG3.1 are supported by this build")
     if not shutil.which("qrencode"):
         print("\nInstall QR renderer: apt update && apt install -y qrencode")
     else:
@@ -1812,7 +1812,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise AmneziaShareError("Dynamic QR output requires a TTY/PTY (for SSH use: ssh -t ...)")
             container = detect_container()
             info = parse_server_info(container)
-            if info.version not in ("2", "3"):
+            if info.version not in ("2", "3.1"):
                 raise AmneziaShareError(f"Unsupported AWG version: {info.version or 'unknown'}")
             host = detect_host(args.host)
             ssh_port = detect_ssh_port(args.ssh_port)
