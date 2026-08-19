@@ -1,11 +1,11 @@
 # amnezia-share 0.2.3
 
-Headless AWG2/AWG3 client management with AmneziaVPN-compatible dynamic QR and native `.conf` export for an Amnezia VPS.
+Headless AWG2/AWG3/AWG3.1 client management with AmneziaVPN-compatible dynamic QR and native `.conf` export for an Amnezia VPS.
 
 Targets the current official Amnezia layout:
 
 - Docker container: `amnezia-awg2`
-- AWG2/AWG3 config: `/opt/amnezia/awg/awg0.conf`
+- AWG2/AWG3/AWG3.1 config: `/opt/amnezia/awg/awg0.conf`
 - clients table: `/opt/amnezia/awg/clientsTable`
 - multi-QR framing compatible with the official Amnezia client
 
@@ -81,6 +81,8 @@ amnezia-share client phone --mtu 1420 --conf
 ```
 
 The accepted range matches Amnezia Client: `576–65535`. Invalid values are rejected before `awg0.conf` or `clientsTable` is changed. In QR profiles MTU is stored as the official `last_config.mtu` field; native exports additionally write `MTU = ...` in `[Interface]`. The `.conf` also has the real DNS values substituted and can be imported by the official Amnezia Client.
+
+Current AWG3/AWG3.1 interface parameters, including `RandomTrailers` and `DisableCookies`, are read automatically from `/opt/amnezia/awg/awg0.conf` and copied unchanged into client QR profiles, native `.conf` exports, and Full Access profiles. No separate CLI flags are required.
 
 List/remove/re-share clients created by the helper:
 

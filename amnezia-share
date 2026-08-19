@@ -71,11 +71,16 @@ AWG_KEYS = [
     "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime",
     "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
     "MaxHandshakeAttempts",
+    "RandomTrailers", "DisableCookies",
 ]
 AWG3_KEYS = [
     "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime",
     "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
     "MaxHandshakeAttempts",
+]
+AWG3_TOGGLE_KEYS = [
+    "RandomTrailers",
+    "DisableCookies",
 ]
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -424,9 +429,17 @@ def peer_records(config_text: str) -> list[dict[str, str]]:
     return out
 
 
+def awg_toggle_enabled(value: str) -> bool:
+    value = value.strip()
+    return bool(value) and value.lower() != "off"
+
+
 def detect_awg_version(values: dict[str, str]) -> str:
     # Mirrors AwgProtocolConfig::awgVersionOf().
     if any(values.get(k, "").strip() for k in AWG3_KEYS):
+        return "3"
+
+    if any(awg_toggle_enabled(values.get(k, "")) for k in AWG3_TOGGLE_KEYS):
         return "3"
 
     has_junk_sizes = any(values.get(k, "").strip() for k in ("S3", "S4"))
@@ -631,7 +644,7 @@ def awg_server_json(info: ServerInfo) -> dict[str, Any]:
     for key in ("I1", "I2", "I3", "I4", "I5"):
         obj[key] = info.interface.get(key, "")
 
-    for key in AWG3_KEYS:
+    for key in AWG3_KEYS + AWG3_TOGGLE_KEYS:
         val = info.interface.get(key, "")
         if val:
             obj[key] = val
@@ -680,6 +693,8 @@ def build_native_awg_config(info: ServerInfo, *, host: str, client_ip: str,
         ("RejectAfterTime", v.get("RejectAfterTime", "")),
         ("KeepaliveTimeout", v.get("KeepaliveTimeout", "")),
         ("MaxHandshakeAttempts", v.get("MaxHandshakeAttempts", "")),
+        ("RandomTrailers", v.get("RandomTrailers", "")),
+        ("DisableCookies", v.get("DisableCookies", "")),
     ]
 
     lines = ["[Interface]"]

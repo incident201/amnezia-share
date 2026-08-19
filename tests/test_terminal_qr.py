@@ -149,6 +149,86 @@ class TerminalQrTests(unittest.TestCase):
         self.assertEqual(decoded_profile["description"], "VPS Netherlands")
         self.assertEqual(last_config["mtu"], "1280")
 
+    def test_awg31_parameters_are_preserved_in_all_exported_profiles(self):
+        config_text = (
+            "[Interface]\n"
+            "RandomTrailers = on\n"
+            "DisableCookies = on\n"
+        )
+        info = amnezia_share.ServerInfo(
+            container="amnezia-awg2",
+            config_text=config_text,
+            interface=amnezia_share.interface_values(config_text),
+            version="3",
+            vpn_port="55424",
+            subnet_address="10.8.1.0",
+            subnet_cidr="24",
+            server_public_key="server-public",
+            psk="preshared",
+        )
+
+        native = amnezia_share.build_native_awg_config(
+            info,
+            host="vpn.example.com",
+            client_ip="10.8.1.2",
+            private_key="client-private",
+            persistent_keepalive="25-35",
+        )
+        self.assertIn("RandomTrailers = on", native)
+        self.assertIn("DisableCookies = on", native)
+
+        profile = amnezia_share.build_client_profile(
+            info,
+            description="VPS Netherlands",
+            host="vpn.example.com",
+            client_ip="10.8.1.2",
+            private_key="client-private",
+            public_key="client-public",
+            dns1="1.1.1.1",
+            dns2="1.0.0.1",
+            mtu="1280",
+        )
+        last_config = json.loads(profile["containers"][0]["awg"]["last_config"])
+        self.assertEqual(last_config["RandomTrailers"], "on")
+        self.assertEqual(last_config["DisableCookies"], "on")
+
+        full_profile = amnezia_share.build_full_profile(
+            info,
+            description="Full access",
+            host="vpn.example.com",
+            ssh_user="root",
+            ssh_secret="private-key",
+            ssh_port=22,
+        )
+        full_awg = full_profile["containers"][0]["awg"]
+        self.assertEqual(full_awg["RandomTrailers"], "on")
+        self.assertEqual(full_awg["DisableCookies"], "on")
+
+    def test_awg_toggle_parameters_detect_awg3_only_when_enabled(self):
+        self.assertEqual(
+            amnezia_share.detect_awg_version({"RandomTrailers": "on"}),
+            "3",
+        )
+        self.assertEqual(
+            amnezia_share.detect_awg_version({"DisableCookies": "on"}),
+            "3",
+        )
+        self.assertEqual(
+            amnezia_share.detect_awg_version(
+                {"RandomTrailers": "off", "DisableCookies": "OFF"}
+            ),
+            "",
+        )
+
+        self.assertEqual(
+            amnezia_share.detect_awg_version({"HeaderProtectionKey": "key"}),
+            "3",
+        )
+        self.assertEqual(
+            amnezia_share.detect_awg_version({"S3": "8"}),
+            "2",
+        )
+
     def test_native_conf_writes_mtu_in_interface(self):
         native = (
             "[Interface]\n"
